@@ -1,0 +1,20 @@
+{
+  "baidu_cookies": [],
+  "baidu_user_agent": "",
+  "bduss": "",
+  "download_dir": "downloads",
+  "threads": 4,
+  "auto_retry": true,
+  "speed_limit": 0,
+  "proxy": "",
+  "max_concurrent": 2,
+  "provider": "baidu",
+  "webdav_url": "",
+  "username": "",
+  "password": "",
+  "aliyun_refresh_token": "",
+  "aliyun_drive_id": "",
+  "quark_cookie": "",
+  "iflytek_url": "",
+  "iflytek_token": ""
+}

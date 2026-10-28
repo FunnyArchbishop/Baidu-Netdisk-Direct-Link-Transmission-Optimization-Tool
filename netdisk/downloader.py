@@ -1,10 +1,11 @@
-﻿"""直链多线程下载器。
+"""直链多线程下载器。
 
 传输优化核心:
 - 分段并发: 文件按固定块大小切分为多个区间, 用线程池并发请求 Range 下载
 - 细粒度断点续传: 每下载完一个块立即写入正式文件并保存状态, 中断后可从已完成的块继续
 - 失败重试: 单块下载失败自动重试, 附带指数退避
 - 实时统计: 汇总下载进度与速度, 回调给 UI 层
+- 完整性校验: 下载完成后可选进行 MD5 校验
 
 线程安全约定: 各块下载区间互不重叠, 写入正式文件时按块偏移 seek 后写入。
 """
@@ -44,6 +45,30 @@ DEFAULT_HEADERS = {
 }
 
 
+class _TokenBucket:
+    """线程安全的令牌桶限速器。rate=0 表示不限速。"""
+
+    def __init__(self, rate: int) -> None:
+        self.rate = max(0, int(rate))
+        self.tokens = float(self.rate)
+        self.updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self, n: int) -> None:
+        if self.rate <= 0 or n <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.rate, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= n:
+                    self.tokens -= n
+                    return
+                deficit = (n - self.tokens) / self.rate
+            time.sleep(min(deficit, 0.5))
+
+
 @dataclass
 class DownloadStats:
     """下载统计信息。"""
@@ -62,7 +87,7 @@ class DirectLinkDownloader:
     用法::
 
         dl = DirectLinkDownloader(url, dest_path, threads=8)
-        dl.download(on_progress=my_cb)
+        dl.download(on_progress=my_cb, expected_md5="...")
     """
 
     def __init__(
@@ -72,19 +97,25 @@ class DirectLinkDownloader:
         threads: int = 4,
         headers: Optional[dict] = None,
         chunk_size: int = CHUNK_SIZE,
+        speed_limit: int = 0,
+        proxy: str = "",
     ) -> None:
         self.url = url
         self.dest_path = os.path.abspath(dest_path)
         self.threads = max(1, min(threads, MAX_THREADS))
         self.chunk_size = chunk_size
+        self.speed_limit = max(0, int(speed_limit or 0))
         self.headers = dict(DEFAULT_HEADERS)
         if headers:
             self.headers.update(headers)
 
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
 
         self.stats = DownloadStats()
+        self._bucket = _TokenBucket(self.speed_limit) if self.speed_limit > 0 else None
         # 块列表: {"start": int, "end": int, "done": bool}
         self._blocks: list[dict] = []
         self._block_queue: queue.Queue = queue.Queue()
@@ -98,17 +129,31 @@ class DirectLinkDownloader:
     # 文件信息探测
     # ------------------------------------------------------------------
     def probe(self) -> tuple[int, bool]:
+        """Retry transient CDN failures before abandoning the download."""
+        for attempt in range(4):
+            try:
+                return self._probe_once()
+            except requests.RequestException:
+                if attempt == 3:
+                    raise
+                time.sleep(0.5 * (2 ** attempt))
+
+    def _probe_once(self) -> tuple[int, bool]:
         """探测文件总大小与是否支持 Range 分段。
 
-        返回 (total_size, supports_range)。
+        返回 (total_size, supports_range)。HEAD 失败时回退到 Range 探测,
+        两者都失败则向上抛出 requests.RequestException。
         """
         total = 0
         accepts_ranges = False
         try:
             resp = self.session.head(self.url, timeout=TIMEOUT, allow_redirects=True)
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            accepts_ranges = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+            try:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                accepts_ranges = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+            finally:
+                resp.close()
         except requests.RequestException:
             # 某些 CDN 不支持 HEAD, 回退为 Range 探测
             resp = self.session.get(
@@ -118,15 +163,17 @@ class DirectLinkDownloader:
                 stream=True,
                 allow_redirects=True,
             )
-            resp.close()
-            if resp.status_code == 206:
-                content_range = resp.headers.get("Content-Range", "")
-                total = int(content_range.split("/")[-1]) if "/" in content_range else 0
-                accepts_ranges = True
-            elif resp.status_code == 200:
-                total = int(resp.headers.get("Content-Length") or 0)
-            else:
-                resp.raise_for_status()
+            try:
+                if resp.status_code == 206:
+                    content_range = resp.headers.get("Content-Range", "")
+                    total = int(content_range.split("/")[-1]) if "/" in content_range else 0
+                    accepts_ranges = True
+                elif resp.status_code == 200:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                else:
+                    resp.raise_for_status()
+            finally:
+                resp.close()
         return total, accepts_ranges
 
     # ------------------------------------------------------------------
@@ -159,16 +206,22 @@ class DirectLinkDownloader:
             return 0
 
     def _save_state(self) -> None:
-        """把当前块进度写入状态文件 (供断点续传)。"""
+        """把当前块进度原子写入状态文件 (供断点续传)。"""
+        tmp_path = self._meta_path + ".tmp"
         try:
-            with open(self._meta_path, "w", encoding="utf-8") as fp:
+            with open(tmp_path, "w", encoding="utf-8") as fp:
                 json.dump(
                     {"url": self.url, "total": self.stats.total, "blocks": self._blocks},
                     fp,
                     ensure_ascii=False,
                 )
+            os.replace(tmp_path, self._meta_path)
         except OSError:
-            pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _remove_state(self) -> None:
         try:
@@ -180,6 +233,11 @@ class DirectLinkDownloader:
     # ------------------------------------------------------------------
     # 下载核心
     # ------------------------------------------------------------------
+    def _rate_limit(self, n: int) -> None:
+        """按令牌桶限速 (speed_limit=0 时为空操作)。"""
+        if self._bucket is not None:
+            self._bucket.consume(n)
+
     def _worker(self) -> None:
         """工作线程: 从队列取块并下载。"""
         while not self._stop.is_set():
@@ -202,6 +260,8 @@ class DirectLinkDownloader:
         err: Optional[Exception] = None
 
         while not self._stop.is_set():
+            # 本次尝试已计入进度的字节数; 失败时回滚, 避免进度虚增
+            attempt_bytes = 0
             try:
                 resp = self.session.get(
                     self.url,
@@ -209,16 +269,24 @@ class DirectLinkDownloader:
                     timeout=TIMEOUT,
                     stream=True,
                 )
-                if resp.status_code not in (200, 206):
-                    raise requests.RequestException(f"HTTP {resp.status_code}")
-
                 buf = io.BytesIO()
-                for data in resp.iter_content(64 * 1024):
-                    if not data:
-                        continue
-                    buf.write(data)
-                    with self._lock:
-                        self.stats.downloaded += len(data)
+                try:
+                    if resp.status_code not in (200, 206):
+                        raise requests.RequestException(f"HTTP {resp.status_code}")
+
+                    for data in resp.iter_content(64 * 1024):
+                        if self._stop.is_set():
+                            return
+                        if not data:
+                            continue
+                        self._rate_limit(len(data))
+                        buf.write(data)
+                        attempt_bytes += len(data)
+                        with self._lock:
+                            self.stats.downloaded += len(data)
+                finally:
+                    resp.close()
+
                 if buf.tell() != expected:
                     raise requests.RequestException(
                         f"响应长度不匹配 (期望 {expected}, 实际 {buf.tell()})"
@@ -233,6 +301,9 @@ class DirectLinkDownloader:
                     self._save_state()
                 return
             except requests.RequestException as exc:
+                # 回滚本次尝试计入的进度, 避免重试导致进度虚增
+                with self._lock:
+                    self.stats.downloaded = max(0, self.stats.downloaded - attempt_bytes)
                 err = exc
                 retries += 1
                 if retries > MAX_RETRIES:
@@ -241,16 +312,31 @@ class DirectLinkDownloader:
                             self.stats.error = f"块 [{start}-{end}] 下载失败: {exc}"
                     self._stop.set()
                     return
-                time.sleep(min(2 ** (retries - 1), 8))
+                self._stop.wait(min(2 ** (retries - 1), 8))
 
         # 被取消: 记录未完成原因
         if err is not None and not self.stats.error:
             with self._lock:
                 self.stats.error = f"块 [{start}-{end}] 未完成: {err}"
 
-    def download(self, on_progress: Optional[ProgressCallback] = None) -> DownloadStats:
-        """执行多线程下载。on_progress 回调用于进度展示。"""
-        total, supports_range = self.probe()
+    def download(
+        self,
+        on_progress: Optional[ProgressCallback] = None,
+        expected_md5: Optional[str] = None,
+    ) -> DownloadStats:
+        """执行多线程下载。
+
+        on_progress 回调用于进度展示; expected_md5 为可选的完整文件
+        MD5 (32 位十六进制), 提供则下载完成后校验文件完整性。
+        """
+        try:
+            total, supports_range = self.probe()
+        except requests.RequestException as exc:
+            self.stats.error = f"无法探测下载地址: {exc}"
+            if on_progress:
+                on_progress(0, 0, 0.0, str(exc))
+            return self.stats
+
         self.stats.total = total
 
         if total == 0:
@@ -258,13 +344,19 @@ class DirectLinkDownloader:
             with open(self.dest_path, "wb"):
                 pass
             self.stats.done = True
-            return self.stats
-
-        if not supports_range:
+        elif not supports_range:
             # 服务端不支持 Range: 退化为单线程整体下载
             self._download_plain(on_progress)
-            return self.stats
+        else:
+            self._download_segmented(on_progress)
 
+        self._verify_integrity(expected_md5)
+        self._emit_terminal(on_progress)
+        return self.stats
+
+    def _download_segmented(self, on_progress: Optional[ProgressCallback]) -> None:
+        """多线程分段下载主体 (Range 可用时)。"""
+        total = self.stats.total
         self._build_blocks(total)
 
         # 初始化 .part 文件 (定长稀疏文件 — 仅在首次下载时创建, 续传时复用)
@@ -329,57 +421,85 @@ class DirectLinkDownloader:
         with self._lock:
             completed = all(b["done"] for b in self._blocks)
 
+        self.stats.speed_bps = 0.0
         if completed and not self.stats.error:
             os.replace(self._part_path, self.dest_path)
             self._remove_state()
             self.stats.done = True
-            self.stats.speed_bps = 0.0
-            if on_progress:
-                on_progress(self.stats.total, self.stats.total, 0.0, "完成")
-        else:
-            self.stats.speed_bps = 0.0
-            if on_progress:
-                with self._lock:
-                    d, t, err = self.stats.downloaded, self.stats.total, self.stats.error
-                on_progress(d, t, 0.0, f"已暂停 ({err or '未完成'})")
 
-        return self.stats
-
-    def _download_plain(self, on_progress: Optional[ProgressCallback] = None) -> None:
+    def _download_plain(self, on_progress: Optional[ProgressCallback]) -> None:
         """不支持 Range 时的整体下载 (单连接 + 失败重试)。"""
         retries = 0
         while retries <= MAX_RETRIES:
+            attempt_bytes = 0
             try:
                 resp = self.session.get(self.url, headers=self.headers, timeout=TIMEOUT, stream=True)
-                resp.raise_for_status()
-                with open(self._part_path, "wb") as fh:
-                    for data in resp.iter_content(64 * 1024):
-                        if self._stop.is_set():
-                            return
-                        if not data:
-                            continue
-                        fh.write(data)
-                        with self._lock:
-                            self.stats.downloaded += len(data)
-                        if on_progress:
+                try:
+                    resp.raise_for_status()
+                    with open(self._part_path, "wb") as fh:
+                        for data in resp.iter_content(64 * 1024):
+                            if self._stop.is_set():
+                                return
+                            if not data:
+                                continue
+                            self._rate_limit(len(data))
+                            fh.write(data)
+                            attempt_bytes += len(data)
                             with self._lock:
-                                d, t = self.stats.downloaded, self.stats.total
-                            on_progress(d, t, 0.0, "下载中...")
+                                self.stats.downloaded += len(data)
+                            if on_progress:
+                                with self._lock:
+                                    d, t = self.stats.downloaded, self.stats.total
+                                on_progress(d, t, 0.0, "下载中...")
+                finally:
+                    resp.close()
                 break
             except requests.RequestException as exc:
+                with self._lock:
+                    self.stats.downloaded = max(0, self.stats.downloaded - attempt_bytes)
                 retries += 1
                 if retries > MAX_RETRIES:
                     with self._lock:
                         self.stats.error = f"下载失败: {exc}"
-                    if on_progress:
-                        on_progress(self.stats.downloaded, self.stats.total, 0.0, str(exc))
                     return
-                time.sleep(2 ** retries)
+                self._stop.wait(2 ** retries)
 
         os.replace(self._part_path, self.dest_path)
         self.stats.done = True
-        if on_progress:
+
+    def _verify_integrity(self, expected_md5: Optional[str]) -> None:
+        """下载成功后校验文件 MD5 (仅当提供 32 位十六进制 MD5 时)。"""
+        if not self.stats.done or not expected_md5:
+            return
+        if not (
+            len(expected_md5) == 32
+            and all(c in "0123456789abcdefABCDEF" for c in expected_md5)
+        ):
+            return
+        try:
+            actual = self.md5_of_file(self.dest_path)
+        except OSError as exc:
+            self.stats.error = f"MD5 校验失败 (读取文件出错): {exc}"
+            self.stats.done = False
+            return
+        if actual.lower() != expected_md5.lower():
+            self.stats.error = f"MD5 校验不通过 (期望 {expected_md5}, 实际 {actual})"
+            self.stats.done = False
+
+    def _emit_terminal(self, on_progress: Optional[ProgressCallback]) -> None:
+        """触发终态进度回调 (完成 / 失败)。"""
+        if not on_progress:
+            return
+        self.stats.speed_bps = 0.0
+        if self.stats.done:
             on_progress(self.stats.total, self.stats.total, 0.0, "完成")
+        else:
+            on_progress(
+                self.stats.downloaded,
+                self.stats.total,
+                0.0,
+                self.stats.error or "已暂停",
+            )
 
     def cancel(self) -> None:
         """取消下载 (保留断点状态, 可续传)。"""
