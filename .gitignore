@@ -1,2 +1,25 @@
 /.venv
+/.venv-web/
+/.runtime/
+/.venv-verify
 /.vscode
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 下载过程中的临时/状态文件
+*.part
+*.download.json
+*.download.json.tmp
+
+# 下载历史记录 (运行时生成)
+download_history.jsonl
+
+# PyInstaller 产物
+/build/
+/dist/
+*.spec
+
+# Local credentials and preferences
+/config.json
